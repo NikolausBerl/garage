@@ -33,14 +33,33 @@ class NPO(BatchPolopt):
     """
     Natural Policy Gradient Optimization.
 
-    Attributes:
-        name(str): The name of the algorithm.
+    Args:
+        pg_loss(enum): The type of loss functions to use.
         lr_clip_range(float): The limit on the likelihood ratio between
             policies, as in PPO.
         max_kl_step(float): The maximum KL divergence between old and new
             policies, as in TRPO.
+        optimizer(object): The optimizer of the algorithm.
+        optimizer_args(dict): The arguments of the optimizer.
+        name(str): The name of the algorithm.
         policy_ent_coeff(float): The coefficient of the policy entropy.
-        optimizer(float): The optimizer of the algorithm.
+        entropy_method(str): A string from: 'max', 'regularized'. The type
+            of entropy method to use. 'max' adds the dense entropy to the
+            reward for each time step. 'regularized' adds the mean entropy
+            to the surrogate objective. See https://arxiv.org/abs/1805.00909
+            for more details.
+            !!NOTE!!: make sure when setting entropy_method to 'max', set
+            `center_adv` to False and turn off policy gradient. `center_adv`
+            normalizes the advantages tensor, which will significantly
+            alleviate the effect of entropy. It is also recommended to turn
+            off entropy gradient so that the agent will focus on high-entropy
+            actions instead of increasing the variance of the distribution.
+        use_neg_logli_entropy(bool): Whether to estimate the entropy as the
+            negative log likelihood of the action.
+        use_softplus_entropy(bool): Whether to estimate the softmax
+            distribution of the entropy to prevent the entropy from being
+            negative.
+        stop_entropy_gradient(bool): Whether to stop the entropy gradient.
     """
 
     def __init__(self,
@@ -50,23 +69,31 @@ class NPO(BatchPolopt):
                  optimizer=None,
                  optimizer_args=None,
                  name='NPO',
-                 policy=None,
                  policy_ent_coeff=0.0,
                  use_softplus_entropy=False,
                  use_neg_logli_entropy=False,
                  stop_entropy_gradient=False,
+                 entropy_method='regularized',
                  **kwargs):
         self.name = name
         self._name_scope = tf.name_scope(self.name)
         self._use_softplus_entropy = use_softplus_entropy
         self._use_neg_logli_entropy = use_neg_logli_entropy
         self._stop_entropy_gradient = stop_entropy_gradient
-
         self._pg_loss = pg_loss
         if optimizer is None:
             if optimizer_args is None:
                 optimizer_args = dict()
             optimizer = LbfgsOptimizer
+
+        if entropy_method == 'max':
+            self._maximum_entropy = True
+            self._entropy_regularzied = False
+        elif entropy_method == 'regularized':
+            self._maximum_entropy = False
+            self._entropy_regularzied = True
+        else:
+            raise NotImplementedError('Unknown entropy_method')
 
         with self._name_scope:
             self.optimizer = optimizer(**optimizer_args)
@@ -74,7 +101,7 @@ class NPO(BatchPolopt):
             self.max_kl_step = float(max_kl_step)
             self.policy_ent_coeff = float(policy_ent_coeff)
 
-        super().__init__(policy=policy, **kwargs)
+        super().__init__(**kwargs)
 
     @overrides
     def init_opt(self):
@@ -237,6 +264,10 @@ class NPO(BatchPolopt):
         policy_entropy = self._build_entropy_term(i)
         rewards = i.reward_var
 
+        if self._maximum_entropy:
+            with tf.name_scope('augmented_rewards'):
+                rewards = i.reward_var + self.policy_ent_coeff * policy_entropy
+
         with tf.name_scope('policy_loss'):
             adv = compute_advantages(
                 self.discount,
@@ -355,7 +386,8 @@ class NPO(BatchPolopt):
                 else:
                     raise NotImplementedError('Unknown PGLoss')
 
-                obj += self.policy_ent_coeff * policy_entropy
+                if self._entropy_regularzied:
+                    obj += self.policy_ent_coeff * policy_entropy
 
                 # Maximize E[surrogate objective] by minimizing
                 # -E_t[surrogate objective]
@@ -392,7 +424,7 @@ class NPO(BatchPolopt):
                     i.policy_state_info_vars,
                     name='policy_dist_info')
 
-                policy_neg_log_likeli = self.policy.distribution.log_likelihood_sym(  # noqa: E501
+                policy_neg_log_likeli = -self.policy.distribution.log_likelihood_sym(  # noqa: E501
                     i.action_var,
                     policy_dist_info,
                     name='policy_log_likeli')
@@ -402,28 +434,43 @@ class NPO(BatchPolopt):
                 else:
                     policy_entropy = self.policy.distribution.entropy_sym(
                         policy_dist_info)
-
             else:
                 policy_dist_info_flat = self.policy.dist_info_sym(
                     i.flat.obs_var,
                     i.flat.policy_state_info_vars,
-                    name='policy_dist_info_flat_entropy')
+                    name='policy_dist_info_flat')
+
+                policy_neg_log_likeli_flat = -self.policy.distribution.log_likelihood_sym(  # noqa: E501
+                    i.flat.action_var,
+                    policy_dist_info_flat,
+                    name='policy_log_likeli_flat')
 
                 policy_dist_info_valid = filter_valids_dict(
                     policy_dist_info_flat,
                     i.flat.valid_var,
                     name='policy_dist_info_valid')
 
-                policy_neg_log_likeli_valid = self.policy.distribution.log_likelihood_sym(  # noqa: E501
+                policy_neg_log_likeli_valid = -self.policy.distribution.log_likelihood_sym(  # noqa: E501
                     i.valid.action_var,
                     policy_dist_info_valid,
-                    name='policy_log_likeli')
+                    name='policy_log_likeli_valid')
 
                 if self._use_neg_logli_entropy:
-                    policy_entropy = policy_neg_log_likeli_valid
+                    if self._maximum_entropy:
+                        policy_entropy = tf.reshape(policy_neg_log_likeli_flat,
+                                                    [-1, self.max_path_length])
+                    else:
+                        policy_entropy = policy_neg_log_likeli_valid
                 else:
-                    policy_entropy = self.policy.distribution.entropy_sym(
-                        policy_dist_info_valid)
+                    if self._maximum_entropy:
+                        policy_entropy_flat = self.policy.distribution.entropy_sym(  # noqa: E501
+                            policy_dist_info_flat)
+                        policy_entropy = tf.reshape(policy_entropy_flat,
+                                                    [-1, self.max_path_length])
+                    else:
+                        policy_entropy_valid = self.policy.distribution.entropy_sym(  # noqa: E501
+                            policy_dist_info_valid)
+                        policy_entropy = policy_entropy_valid
 
             # This prevents entropy from becoming negative for small policy std
             if self._use_softplus_entropy:

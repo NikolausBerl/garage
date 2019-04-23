@@ -6,8 +6,8 @@ Here it creates InvertedDoublePendulum using gym. And uses a PPO with 1M
 steps.
 
 Results:
-    AverageDiscountedReturn: 528.3
-    RiseTime: itr 250
+    AverageDiscountedReturn: 500
+    RiseTime: itr 40
 """
 import gym
 import tensorflow as tf
@@ -22,7 +22,7 @@ from garage.tf.policies import GaussianMLPPolicy
 
 def run_task(*_):
     with LocalRunner() as runner:
-        env = TfEnv(normalize(gym.make("InvertedDoublePendulum-v2")))
+        env = TfEnv(normalize(gym.make('InvertedDoublePendulum-v2')))
 
         policy = GaussianMLPPolicy(
             env_spec=env.spec,
@@ -39,6 +39,9 @@ def run_task(*_):
             ),
         )
 
+        # NOTE: make sure when setting entropy_method to 'max', set
+        # center_adv to False and turn off policy gradient. See
+        # tf.algos.NPO for detailed documentation.
         algo = PPO(
             env_spec=env.spec,
             policy=policy,
@@ -47,12 +50,15 @@ def run_task(*_):
             discount=0.99,
             gae_lambda=0.95,
             lr_clip_range=0.2,
-            policy_ent_coeff=0.0,
             optimizer_args=dict(
                 batch_size=32,
                 max_epochs=10,
             ),
             plot=False,
+            stop_entropy_gradient=True,
+            entropy_method='max',
+            policy_ent_coeff=0.02,
+            center_adv=False,
         )
 
         runner.setup(algo, env)
@@ -60,4 +66,4 @@ def run_task(*_):
         runner.train(n_epochs=120, batch_size=2048, plot=False)
 
 
-run_experiment(run_task, snapshot_mode="last", seed=1)
+run_experiment(run_task, snapshot_mode='last', seed=1)
